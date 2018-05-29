@@ -12,17 +12,12 @@
 
 // frequency = 1,000,000 / period
 // period = 1,000,000 / frequency
-#define PWM_PERIOD (200000UL)
-#define PWM_PERIOD_MIN (100UL)
-#define PWM_PERIOD_MAX (500000UL)
 
-// 10 - 6.56 Hz
-//#define PWM_PERIOD_MIN (100000UL)
-//#define PWM_PERIOD_MAX (180000UL)
+//#define PWM_PERIOD_MIN (5UL)
+//#define PWM_PERIOD_MAX (500UL)
 
-// 6.94 - 8 Hz
-//#define PWM_PERIOD_MIN (144000UL)
-//#define PWM_PERIOD_MAX (125000UL)
+#define PWM_PERIOD_MIN (5UL)
+#define PWM_PERIOD_MAX (800UL)
 
 #define PIN_BTN0 (21)
 #define PIN_BTN1 (20)
@@ -44,23 +39,61 @@ typedef struct
     uint16_t pot0;
     uint16_t pot1;
     uint16_t csa;
+    uint16_t map_top;
+    uint32_t map_period;
 } input_s;
 
 typedef struct
 {
-    uint16_t ena;
-    uint8_t in1;
-    uint8_t in2;
-    uint32_t timer_period;
-} output_s;
+    uint8_t dir;
+    uint8_t mag;
+    uint8_t top;
+} waveform_s;
 
-static volatile uint8_t timer_state;
+static volatile waveform_s g_waveform;
 
 static void timer_callback(void)
 {
-    digitalWrite(PIN_LED, timer_state);
+    g_waveform.mag += 1;
 
-    timer_state = !timer_state;
+    if(g_waveform.mag == g_waveform.top)
+    {
+        g_waveform.mag = 0;
+        g_waveform.dir = !g_waveform.dir;
+    }
+
+    write_output();
+}
+
+static void write_output(void)
+{
+    if(g_waveform.dir == 0)
+    {
+        digitalWrite(PIN_IN1, LOW);
+        digitalWrite(PIN_IN2, HIGH);
+        digitalWrite(PIN_LED, LOW);
+    }
+    else
+    {
+        digitalWrite(PIN_IN1, HIGH);
+        digitalWrite(PIN_IN2, LOW);
+        digitalWrite(PIN_LED, HIGH);
+    }
+
+    analogWrite(PIN_ENA, g_waveform.mag);
+}
+
+static void set_waveform(
+        const uint8_t top,
+        const uint8_t dir)
+{
+    noInterrupts();
+
+    g_waveform.mag = 0;
+    g_waveform.top = top;
+    g_waveform.dir = dir;
+
+    interrupts();
 }
 
 static void read_input(
@@ -74,53 +107,44 @@ static void read_input(
 
     input->pot1 = (uint16_t) analogRead(PIN_POT1);
     input->csa = (uint16_t) analogRead(PIN_CSA);
-}
 
-static void write_output(
-        const output_s * const output)
-{
-    Timer3.setPeriod(output->timer_period);
-    digitalWrite(PIN_IN1, (output->in1 == 0 ? LOW : HIGH));
-    digitalWrite(PIN_IN2, (output->in2 == 0 ? LOW : HIGH));
-    analogWrite(PIN_ENA, output->ena);
+    input->map_top = map(
+            input->pot0,
+            0,
+            1023,
+            1,
+            255);
+
+    input->map_period = map(
+            input->pot1,
+            0,
+            1023,
+            PWM_PERIOD_MIN,
+            PWM_PERIOD_MAX);
 }
 
 static void print_input(
         const input_s * const input)
 {
-    Serial.print("BT0: ");
-    Serial.print(input->btn0);
-    Serial.print(" BT1: ");
-    Serial.print(input->btn1);
-    Serial.print(" BT2: ");
-    Serial.print(input->btn2);
+    const float freq = 1000000.0f / (float) input->map_period;
+
     Serial.print(" PT0: ");
     Serial.print(input->pot0);
     Serial.print(" PT1: ");
     Serial.print(input->pot1);
     Serial.print(" CSA: ");
-    Serial.println(input->csa);
-}
-
-static void print_output(
-        const output_s * const output)
-{
-    const float freq = 1000000.0f / (float) output->timer_period;
-
-    Serial.print("IN1: ");
-    Serial.print(output->in1);
-    Serial.print(" IN2: ");
-    Serial.print(output->in2);
-    Serial.print(" ENA: ");
-    Serial.print(output->ena);
-    Serial.print(" T3P: ");
-    Serial.print(output->timer_period);
-    Serial.print(" T3F: ");
+    Serial.print(input->csa);
+    Serial.print(" T: ");
+    Serial.print(input->map_top);
+    Serial.print(" P: ");
+    Serial.print(input->map_period);
+    Serial.print(" F: ");
     Serial.println(freq);
 }
 
 static void disable_output(void)
 {
+    Timer3.stop();
     digitalWrite(PIN_ENA, LOW);
     digitalWrite(PIN_IN1, LOW);
     digitalWrite(PIN_IN2, LOW);
@@ -128,8 +152,6 @@ static void disable_output(void)
 
 void setup(void)
 {
-    timer_state = 0;
-
     pinMode(PIN_ENA, OUTPUT);
     pinMode(PIN_IN1, OUTPUT);
     pinMode(PIN_IN2, OUTPUT);
@@ -141,102 +163,54 @@ void setup(void)
     pinMode(PIN_POT0, INPUT);
     pinMode(PIN_POT1, INPUT);
 
-    disable_output();
-
     pinMode(PIN_LED, OUTPUT);
     digitalWrite(PIN_LED, LOW);
 
-    Timer3.initialize(PWM_PERIOD);
+    disable_output();
+
+    set_waveform(0xFF, 0);
+
+    Timer3.initialize(PWM_PERIOD_MAX);
     Timer3.attachInterrupt(&timer_callback);
+    disable_output();
 
     Serial.begin(115200);
 }
 
 void loop(void)
 {
-    // pot0 -> pwm frequency (should be fixed?)
-    // pot1 -> direction toggle frequency
-    //
-    // bt0 ->
-    // bt1 ->
-    // bt2 ->
-
     input_s input;
-    output_s output;
+
+    read_input(&input);
+
+    print_input(&input);
+
+    if(input.btn0 != 0)
+    {
+        set_waveform(
+                input.map_top,
+                g_waveform.dir);
+
+        Timer3.setPeriod(input.map_period);
+
+        do
+        {
+            const uint16_t last_p = input.pot1;
+
+            read_input(&input);
+
+            if(last_p != input.pot1)
+            {
+                Timer3.setPeriod(input.map_period);
+            }
+        }
+        while(input.btn0 != 0);
+    }
 
     disable_output();
-
-    Serial.println("\n\nwaiting for btn0 press\n");
-
-    // wait for btn0 to be pressed
-    do
-    {
-        read_input(&input);
-    }
-    while(input.btn0 == 0);
-
-    Serial.println("\nloop until btn1 press\n");
     delay(50);
 
-    // wait for btn1 to be pressed
-    do
-    {
-        read_input(&input);
-        print_input(&input);
-
-        delay(50);
-    }
-    while(input.btn1 == 0);
-
-    Serial.println("\nenabling output until btn2 press\n");
-    delay(50);
-
-    // drive output loops until btn2 is pressed
-    do
-    {
-        read_input(&input);
-
-        if(input.btn1 != 0)
-        {
-            if(timer_state == 0)
-            {
-                output.in1 = 1;
-                output.in2 = 0;
-            }
-            else
-            {
-                output.in1 = 0;
-                output.in2 = 1;
-            }
-
-            output.ena = map(
-                    input.pot0,
-                    0,
-                    1023,
-                    0,
-                    255);
-
-            output.timer_period = map(
-                    input.pot1,
-                    0,
-                    1023,
-                    PWM_PERIOD_MIN,
-                    PWM_PERIOD_MAX);
-
-            write_output(&output);
-        }
-        else
-        {
-            disable_output();
-        }
-
-        print_input(&input);
-        print_output(&output);
-
-        delay(20);
-    }
-    while(input.btn2 == 0);
-
-    disable_output();
-    delay(1000);
+    //Serial.println("\n\nwaiting for btn0 press\n");
+    //disable_output();
+    //delay(1000);
 }
